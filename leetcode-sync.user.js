@@ -164,7 +164,7 @@
       query submissionDetails($submissionId: Int!) {
         submissionDetails(submissionId: $submissionId) {
           code
-          lang
+          lang { name }
           runtime
           memory
           statusDisplay
@@ -173,13 +173,13 @@
             titleSlug
             title
             difficulty
-            frontendQuestionId
+            questionId
           }
         }
       }
     `;
     const data = await leetcodeGraphql(query, { submissionId });
-    return data.submissionDetails;
+    return (data && data.submissionDetails) || {};
   }
 
   async function getLatestAcceptedSubmission(titleSlug) {
@@ -254,11 +254,12 @@
       const { code, lang, runtime, memory, statusDisplay, timestamp, question } = submission;
       if (!question) throw new Error("No question info in submission");
 
-      const { titleSlug, title, difficulty, frontendQuestionId } = question;
+      const langName = (lang && lang.name) ? lang.name : lang;
+      const { titleSlug, title, difficulty, questionId } = question;
       const diffLabel = CONFIG.difficultyMap[difficulty] || "unknown";
-      const filePath = getFilePath(difficulty, titleSlug, lang);
+      const filePath = getFilePath(difficulty, titleSlug, langName);
 
-      log(`Processing: ${title} (${diffLabel}) - ${lang}`);
+      log(`Processing: ${title} (${diffLabel}) - ${langName}`);
 
       const existingSha = await getFileSha(filePath);
       if (existingSha) {
@@ -271,7 +272,7 @@
         }
       }
 
-      const message = `feat(leetcode): add ${title} (${diffLabel}) [${frontendQuestionId}]\n\nLanguage: ${lang}\nRuntime: ${runtime}ms\nMemory: ${memory}MB\nLeetCode: https://leetcode.com/problems/${titleSlug}/`;
+      const message = `feat(leetcode): add ${title} (${diffLabel}) [${questionId}]\n\nLanguage: ${langName}\nRuntime: ${runtime}ms\nMemory: ${memory}MB\nLeetCode: https://leetcode.com/problems/${titleSlug}/`;
       
       await commitFile(filePath, code, message, existingSha);
 
@@ -303,7 +304,7 @@
     log(`Submission page detected: ${submissionId}`);
     try {
       const details = await getSubmissionDetails(submissionId);
-      if (details.statusDisplay === "Accepted") {
+      if (details && details.statusDisplay === "Accepted") {
         await processAcceptedSubmission(details);
       }
     } catch (err) {
@@ -369,7 +370,7 @@
     getPat,
     syncNow: async (titleSlug) => {
       const submission = await getLatestAcceptedSubmission(titleSlug);
-      if (submission) await processAcceptedSubmission({ ...submission, question: { titleSlug, title: titleSlug, difficulty: 1 } });
+      if (submission) await processAcceptedSubmission({ ...submission, question: { titleSlug, title: titleSlug, difficulty: 1, questionId: submission.questionId || titleSlug } });
     }
   };
 })();
