@@ -1,0 +1,206 @@
+name: Auto PR & Merge
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_title:
+        description: "PR Title (optional)"
+        required: false
+        type: string
+      pr_body:
+        description: "PR Body in markdown (optional)"
+        required: false
+        type: string
+      base_branch:
+        description: "Target branch"
+        required: false
+        default: "main"
+        type: string
+  push:
+    branches:
+      - "feature/**"
+  schedule:
+    - cron: "0 2 * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  create-pr:
+    name: Create / Update PR
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    outputs:
+      pr_number: ${{ steps.create-pr.outputs.pr_number }}
+      head_branch: ${{ steps.create-pr.outputs.head_branch }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine head branch
+        id: branch
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            BRANCH="auto-pr/${{ github.run_id }}"
+          else
+            BRANCH="${{ github.ref_name }}"
+          fi
+          echo "head_branch=$BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Check for existing open PR
+        id: existing-pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head: `${context.repo.owner}:${{ steps.branch.outputs.head_branch }}`,
+              state: 'open',
+              per_page: 1
+            });
+            if (prs.length > 0) {
+              core.setOutput('pr_number', prs[0].number);
+              core.setOutput('exists', 'true');
+            } else {
+              core.setOutput('exists', 'false');
+            }
+
+      - name: Create PR
+        id: create-pr
+        if: steps.existing-pr.outputs.exists == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = "${{ github.event.inputs.pr_title }}" || `chore: auto PR from ${{ steps.branch.outputs.head_branch }}`;
+            const body = "${{ github.event.inputs.pr_body }}" || `Auto-generated PR from \`${{ steps.branch.outputs.head_branch }}\` branch.\n\n---\n*Created by Auto PR workflow*`;
+            const base = "${{ github.event.inputs.base_branch || 'main' }}";
+            
+            const { data: pr } = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              head: `${context.repo.owner}:${{ steps.branch.outputs.head_branch }}`,
+              base,
+              body,
+              draft: false
+            });
+            core.setOutput('pr_number', pr.number);
+            core.setOutput('head_branch', '${{ steps.branch.outputs.head_branch }}');
+
+      - name: Update existing PR (push trigger)
+        if: steps.existing-pr.outputs.exists == 'true' && github.event_name == 'push'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: ${{ steps.existing-pr.outputs.pr_number }},
+              body: `Auto-updated PR from \`${{ steps.branch.outputs.head_branch }}\` branch.\n\n---\n*Last updated: ${new Date().toISOString()}*`
+            });
+            core.setOutput('pr_number', '${{ steps.existing-pr.outputs.pr_number }}');
+            core.setOutput('head_branch', '${{ steps.branch.outputs.head_branch }}');
+
+  auto-review:
+    name: Auto Review (Syntax Check)
+    runs-on: ubuntu-latest
+    needs: create-pr
+    if: needs.create-pr.outputs.pr_number != ''
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.create-pr.outputs.head_branch }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Validate Python syntax (.py files)
+        run: |
+          find . -name "*.py" -not -path "./.git/*" | xargs -r python3 -m py_compile
+
+      - name: Validate Notebook JSON (.ipynb files)
+        run: |
+          find . -name "*.ipynb" -not -path "./.git/*" | xargs -r python3 -c "
+import json, sys
+for f in sys.argv[1:]:
+    with open(f) as fp:
+        json.load(fp)
+    print(f'OK: {f}')
+"
+
+      - name: Check for merge conflicts
+        run: |
+          git fetch origin main
+          git merge-tree $(git merge-base origin/main HEAD) origin/main HEAD >/dev/null || {
+            echo "::error::Merge conflicts detected with main"
+            exit 1
+          }
+
+  auto-merge:
+    name: Auto Merge (Label-Gated)
+    runs-on: ubuntu-latest
+    needs: [create-pr, auto-review]
+    if: needs.create-pr.outputs.pr_number != ''
+    steps:
+      - name: Enable Auto-Merge when label present
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: ${{ needs.create-pr.outputs.pr_number }}
+            });
+            
+            const hasAutoMergeLabel = pr.labels.some(l => l.name === 'auto-merge');
+            const mergeable = pr.mergeable === true;
+            const checksPassed = pr.mergeable_state === 'clean';
+            
+            if (hasAutoMergeLabel && mergeable && checksPassed) {
+              await github.rest.pulls.merge({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: ${{ needs.create-pr.outputs.pr_number }},
+                merge_method: 'squash'
+              });
+              console.log(`Auto-merged PR #${{ needs.create-pr.outputs.pr_number }}`);
+              
+              await github.rest.git.deleteRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `heads/${{ needs.create-pr.outputs.head_branch }}`
+              });
+              console.log(`Deleted branch ${{ needs.create-pr.outputs.head_branch }}`);
+            } else {
+              console.log('Auto-merge conditions not met:');
+              console.log(`  auto-merge label: ${hasAutoMergeLabel}`);
+              console.log(`  mergeable: ${mergeable}`);
+              console.log(`  checks clean: ${checksPassed}`);
+            }
+
+      - name: Add Copilot PR Summary (native)
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Trigger GitHub's native Copilot PR summary generation
+            // This is a no-op API call that prompts Copilot to generate summary
+            try {
+              await github.rest.pulls.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: ${{ needs.create-pr.outputs.pr_number }},
+                body: pr.body // No-op update triggers Copilot
+              });
+            } catch (e) {
+              console.log('Copilot summary trigger skipped:', e.message);
+            }
