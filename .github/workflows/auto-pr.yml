@@ -19,6 +19,8 @@ on:
   push:
     branches:
       - "feature/**"
+    paths-ignore:
+      - "leetcode/**"
   schedule:
     - cron: "0 2 * * *"
 
@@ -129,13 +131,7 @@ jobs:
 
       - name: Validate Notebook JSON (.ipynb files)
         run: |
-          find . -name "*.ipynb" -not -path "./.git/*" | xargs -r python3 -c "
-import json, sys
-for f in sys.argv[1:]:
-    with open(f) as fp:
-        json.load(fp)
-    print(f'OK: {f}')
-"
+          find . -name "*.ipynb" -not -path "./.git/*" | xargs -r python3 -c "import json,sys; [json.load(open(f)) for f in sys.argv[1:]]"
 
       - name: Check for merge conflicts
         run: |
@@ -193,12 +189,17 @@ for f in sys.argv[1:]:
         with:
           script: |
             // Trigger GitHub's native Copilot PR summary generation
-            // This is a no-op API call that prompts Copilot to generate summary
             try {
+              const prNum = Number(${{ needs.create-pr.outputs.pr_number }});
+              const { data: pr } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNum
+              });
               await github.rest.pulls.update({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                pull_number: ${{ needs.create-pr.outputs.pr_number }},
+                pull_number: prNum,
                 body: pr.body // No-op update triggers Copilot
               });
             } catch (e) {
