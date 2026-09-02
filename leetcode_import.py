@@ -26,6 +26,22 @@ REPO_OWNER = "vatsalyd"
 REPO_NAME = "learning"
 
 DIFFICULTY_MAP = {1: "easy", 2: "medium", 3: "hard"}
+DIFFICULTY_STR = {"Easy": 1, "Medium": 2, "Hard": 3}
+
+
+def normalize_difficulty(difficulty) -> int:
+    """Return difficulty as an int key (1=easy,2=medium,3=hard).
+
+    Handles GraphQL returning either an int (1/2/3) or a capitalized string
+    ("Easy"/"Medium"/"Hard").
+    """
+    if isinstance(difficulty, int) and difficulty in DIFFICULTY_MAP:
+        return difficulty
+    if isinstance(difficulty, str):
+        normalized = difficulty.strip().capitalize()
+        if normalized in DIFFICULTY_STR:
+            return DIFFICULTY_STR[normalized]
+    return 1  # safe default
 LANG_EXT = {
     "python3": "py", "python": "py", "java": "java", "cpp": "cpp", "c": "c",
     "csharp": "cs", "javascript": "js", "typescript": "ts", "go": "go",
@@ -60,20 +76,30 @@ def github_request(method: str, path: str, pat: str, **kwargs) -> requests.Respo
     return resp
 
 
-def leetcode_graphql(query: str, variables: dict, cookies: dict = None) -> dict:
+def leetcode_graphql(query: str, variables: dict, cookies: dict = None, retries: int = 4) -> dict:
     headers = {
         "Content-Type": "application/json",
         "Referer": "https://leetcode.com/",
         "Origin": "https://leetcode.com",
         "User-Agent": "LeetCode-Import-Script/1.0"
     }
-    resp = SESSION.post(LEETCODE_GRAPHQL, json={"query": query, "variables": variables}, headers=headers, cookies=cookies)
-    if resp.status_code >= 400:
-        raise RuntimeError(f"LeetCode GraphQL {resp.status_code}: {resp.text}")
-    data = resp.json()
-    if data.get("errors"):
-        raise RuntimeError(f"GraphQL errors: {data['errors']}")
-    return data["data"]
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            resp = SESSION.post(LEETCODE_GRAPHQL, json={"query": query, "variables": variables}, headers=headers, cookies=cookies, timeout=30)
+            if resp.status_code >= 400:
+                raise RuntimeError(f"LeetCode GraphQL {resp.status_code}: {resp.text}")
+            data = resp.json()
+            if data.get("errors"):
+                raise RuntimeError(f"GraphQL errors: {data['errors']}")
+            return data["data"]
+        except (requests.exceptions.RequestException, ValueError) as e:
+            last_err = e
+            if attempt < retries:
+                wait = 2 ** attempt
+                log(f"GraphQL attempt {attempt + 1} failed ({e}), retrying in {wait}s...", "WARN")
+                time.sleep(wait)
+    raise RuntimeError(f"LeetCode GraphQL failed after {retries + 1} attempts: {last_err}")
 
 
 def get_file_path(difficulty: int, title_slug: str, lang: str) -> str:
@@ -120,8 +146,42 @@ def hash_code(code: str) -> str:
     return hashlib.sha256(code.encode()).hexdigest()[:16]
 
 
+def get_current_username(leetcode_session: str) -> str:
+    """Derive the logged-in username from the session cookie."""
+    query = """
+    query globalData {
+      userStatus {
+        isSignedIn
+        username
+      }
+    }
+    """
+    cookies = {"LEETCODE_SESSION": leetcode_session} if leetcode_session else None
+    data = leetcode_graphql(query, {}, cookies)
+    try:
+        return data["userStatus"]["username"]
+    except (KeyError, TypeError):
+        raise RuntimeError("Could not determine username from session cookie; pass --username explicitly")
+
+
 def get_all_ac_submissions(leetcode_session: str, username: str) -> List[Dict]:
-    """Fetch all accepted submissions for a user via GraphQL."""
+    """Fetch accepted submissions for a user via GraphQL.
+
+    Prefers the authenticated, paginated `submissionList` query when a session
+    cookie is available (allows pulling more than the ~20 recent items that
+    `recentAcSubmissionList` caps at). Falls back to `recentAcSubmissionList`
+    for public/username-only access.
+    """
+    cookies = {"LEETCODE_SESSION": leetcode_session} if leetcode_session else None
+
+    # Authenticated + paginated path
+    if leetcode_session:
+        try:
+            return _get_paginated_submissions(cookies)
+        except Exception as e:
+            log(f"Authenticated submissionList query failed ({e}), falling back to recentAcSubmissionList", "WARN")
+
+    # Public fallback (capped at ~20 most recent, no pagination support)
     query = """
     query recentAcSubmissions($username: String!, $limit: Int!) {
       recentAcSubmissionList(username: $username, limit: $limit) {
@@ -136,18 +196,67 @@ def get_all_ac_submissions(leetcode_session: str, username: str) -> List[Dict]:
       }
     }
     """
-    cookies = {"LEETCODE_SESSION": leetcode_session} if leetcode_session else None
-    data = leetcode_graphql(query, {"username": username, "limit": 5000}, cookies)
-    return data["recentAcSubmissionList"]
+    data = leetcode_graphql(query, {"username": username, "limit": 100}, cookies)
+    return data.get("recentAcSubmissionList") or []
 
 
-def get_submission_code(submission_id: int, leetcode_session: str) -> Dict:
+def _get_paginated_submissions(cookies: dict) -> List[Dict]:
+    """Fetch full submission history via authenticated submissionList query."""
+    query = """
+    query submissionList($offset: Int!, $limit: Int!, $lastKey: String) {
+      submissionList(offset: $offset, limit: $limit, lastKey: $lastKey) {
+        lastKey
+        hasNext
+        submissions {
+          id
+          title
+          titleSlug
+          timestamp
+          lang
+          statusDisplay
+          runtime
+          memory
+        }
+      }
+    }
+    """
+    all_subs = []
+    last_key = None
+    page_size = 20
+    seen = set()
+
+    while True:
+        data = leetcode_graphql(query, {"offset": 0, "limit": page_size, "lastKey": last_key}, cookies)
+        page = (data.get("submissionList") or {})
+        subs = page.get("submissions") or []
+        new_items = 0
+        for s in subs:
+            sid = s.get("id")
+            if sid in seen:
+                continue
+            seen.add(sid)
+            all_subs.append(s)
+            new_items += 1
+
+        if new_items == 0:
+            break
+        next_key = page.get("lastKey")
+        has_next = page.get("hasNext") is True or next_key is not None
+        if not has_next or not next_key:
+            break
+        last_key = next_key
+        time.sleep(0.3)
+
+    return all_subs
+
+
+def get_submission_code(submission_id, leetcode_session: str) -> Dict:
     """Fetch full submission details including code."""
     query = """
     query submissionDetails($submissionId: Int!) {
       submissionDetails(submissionId: $submissionId) {
         code
-        lang
+        lang { name }
         runtime
         memory
         statusDisplay
@@ -156,14 +265,19 @@ def get_submission_code(submission_id: int, leetcode_session: str) -> Dict:
           titleSlug
           title
           difficulty
-          frontendQuestionId
+          questionId
         }
       }
     }
     """
+    # Ensure the id is an int for the GraphQL Int! argument (list endpoints return string ids)
+    try:
+        submission_id = int(submission_id)
+    except (TypeError, ValueError):
+        return {}
     cookies = {"LEETCODE_SESSION": leetcode_session} if leetcode_session else None
     data = leetcode_graphql(query, {"submissionId": submission_id}, cookies)
-    return data["submissionDetails"]
+    return data.get("submissionDetails") or {}
 
 
 def get_question_difficulty(title_slug: str, leetcode_session: str) -> int:
@@ -183,7 +297,7 @@ def get_question_difficulty(title_slug: str, leetcode_session: str) -> int:
 
 def main():
     parser = argparse.ArgumentParser(description="Import past LeetCode solves to GitHub")
-    parser.add_argument("--username", help="LeetCode username (required for public profile fetch)")
+    parser.add_argument("--username", help="LeetCode username (optional if --leetcode-session is provided)")
     parser.add_argument("--leetcode-session", help="LeetCode SESSION cookie (for private/profile access)")
     parser.add_argument("--gh-pat", help="GitHub PAT (or set GH_PAT env var)")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be done without committing")
@@ -204,15 +318,41 @@ def main():
 
     leetcode_session = args.leetcode_session or os.getenv("LEETCODE_SESSION")
 
-    log(f"Fetching accepted submissions for {args.username or 'authenticated user'}...")
+    username = args.username
+    if not username:
+        if leetcode_session:
+            log("Session cookie provided, deriving username...")
+            try:
+                username = get_current_username(leetcode_session)
+                log(f"Derived username: {username}")
+            except Exception as e:
+                log(f"{e}", "ERROR")
+                sys.exit(1)
+        else:
+            log("Either --username (public) or --leetcode-session (private) required", "ERROR")
+            sys.exit(1)
+
+    log(f"Fetching accepted submissions for {username}...")
     try:
-        submissions = get_all_ac_submissions(leetcode_session, args.username or "")
+        submissions = get_all_ac_submissions(leetcode_session, username)
     except Exception as e:
         log(f"Failed to fetch submissions: {e}", "ERROR")
         log("Tip: Provide --leetcode-session cookie from browser for private profiles", "WARN")
         sys.exit(1)
 
     log(f"Found {len(submissions)} accepted submissions")
+
+    # Deduplicate by problem, keeping the most recent submission per titleSlug
+    by_slug = {}
+    for sub in submissions:
+        slug = sub.get("titleSlug")
+        if not slug:
+            continue
+        ts = int(sub.get("timestamp") or 0)
+        if slug not in by_slug or ts > int(by_slug[slug].get("timestamp") or 0):
+            by_slug[slug] = sub  # keeps the latest solve
+    submissions = list(by_slug.values())
+    log(f"After dedup: {len(submissions)} unique problems")
 
     processed = 0
     skipped = 0
@@ -229,17 +369,18 @@ def main():
 
         try:
             details = get_submission_code(sub["id"], leetcode_session)
-            if not details.get("code"):
-                log("  No code in submission, skipping", "WARN")
+            if not details or not details.get("code"):
+                log("  No code in submission (session cookie may be needed), skipping", "WARN")
                 skipped += 1
                 continue
 
-            difficulty = details["question"]["difficulty"] if details.get("question") else get_question_difficulty(title_slug, leetcode_session)
-            lang = details["lang"]
+            raw_difficulty = details["question"]["difficulty"] if details.get("question") else get_question_difficulty(title_slug, leetcode_session)
+            difficulty = normalize_difficulty(raw_difficulty)
+            lang = details["lang"]["name"] if isinstance(details["lang"], dict) else details["lang"]
             code = details["code"]
             runtime = details.get("runtime", "N/A")
             memory = details.get("memory", "N/A")
-            frontend_id = details["question"]["frontendQuestionId"] if details.get("question") else "?"
+            frontend_id = details["question"]["questionId"] if details.get("question") else "?"
 
             file_path = get_file_path(difficulty, title_slug, lang)
 
