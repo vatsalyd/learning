@@ -27,14 +27,22 @@
     patKey: "LEETCODE_GH_PAT",
     patCreatedKey: "LEETCODE_GH_PAT_CREATED",
     patRotationDays: 90,
-    committer: {
-      name: "LeetCode Bot",
-      email: "leetcode-bot@users.noreply.github.com"
-    },
     difficultyMap: {
       1: "easy",
       2: "medium",
       3: "hard"
+    },
+    normalizeDifficulty(difficulty) {
+      if (typeof difficulty === "number" && [1, 2, 3].includes(difficulty)) {
+        return difficulty;
+      }
+      if (typeof difficulty === "string") {
+        const d = difficulty.trim().toLowerCase();
+        if (d === "easy") return 1;
+        if (d === "medium") return 2;
+        if (d === "hard") return 3;
+      }
+      return 1;
     },
     langExt: {
       python3: "py",
@@ -230,7 +238,6 @@
     const body = {
       message,
       content: btoa(unescape(encodeURIComponent(content))),
-      committer: CONFIG.committer,
       branch: "main"
     };
     if (sha) body.sha = sha;
@@ -256,8 +263,9 @@
 
       const langName = (lang && lang.name) ? lang.name : lang;
       const { titleSlug, title, difficulty, questionId } = question;
-      const diffLabel = CONFIG.difficultyMap[difficulty] || "unknown";
-      const filePath = getFilePath(difficulty, titleSlug, langName);
+      const normDiff = CONFIG.normalizeDifficulty(difficulty);
+      const diffLabel = CONFIG.difficultyMap[normDiff] || "unknown";
+      const filePath = getFilePath(normDiff, titleSlug, langName);
 
       log(`Processing: ${title} (${diffLabel}) - ${langName}`);
 
